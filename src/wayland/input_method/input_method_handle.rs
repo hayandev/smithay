@@ -34,10 +34,20 @@ pub(crate) struct InputMethod {
     pub keyboard_grab: InputMethodKeyboardGrab,
 }
 
+// Fixes the issue where backspace needs to be pressed twice to delete a character in Chrome.
+// This is due to differences in protocol interpretation and will not be needed once Chrome resolves the issue.
+#[derive(Debug, Default)]
+pub(crate) struct InputMethodPreeditStatus {
+    text: Option<String>,
+    cursor_begin: i32,
+    cursor_end: i32,
+}
+
 #[derive(Debug)]
 pub(crate) struct Instance {
     pub object: ZwpInputMethodV2,
     pub serial: u32,
+    pub pending_preedit: InputMethodPreeditStatus,
 }
 
 impl Instance {
@@ -64,6 +74,7 @@ impl InputMethodHandle {
             inner.instance = Some(Instance {
                 object: instance.clone(),
                 serial: 0,
+                pending_preedit: Default::default(),
             });
         }
     }
@@ -215,8 +226,13 @@ where
                 cursor_begin,
                 cursor_end,
             } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.preedit_string(Some(text.clone()), cursor_begin, cursor_end);
+                let mut text_input = data.handle.inner.lock().unwrap();
+                text_input.instance.as_mut().map(|f| {
+                    f.pending_preedit = InputMethodPreeditStatus {
+                        text: Some(text),
+                        cursor_begin,
+                        cursor_end,
+                    };
                 });
             }
             zwp_input_method_v2::Request::DeleteSurroundingText {
@@ -228,16 +244,20 @@ where
                 });
             }
             zwp_input_method_v2::Request::Commit { serial } => {
-                let current_serial = data
-                    .handle
-                    .inner
-                    .lock()
-                    .unwrap()
+                let mut input_method = data.handle.inner.lock().unwrap();
+                let (current_preedit, current_serial) = input_method
                     .instance
-                    .as_ref()
-                    .map(|i| i.serial)
-                    .unwrap_or(0);
+                    .as_mut()
+                    .map(|i| (std::mem::take(&mut i.pending_preedit), i.serial))
+                    .unwrap_or((Default::default(), 0));
 
+                data.text_input_handle.with_active_text_input(|ti, _| {
+                    ti.preedit_string(
+                        current_preedit.text.clone(),
+                        current_preedit.cursor_begin,
+                        current_preedit.cursor_end,
+                    );
+                });
                 data.text_input_handle.done(serial != current_serial);
             }
             zwp_input_method_v2::Request::GetInputPopupSurface { id, surface } => {
